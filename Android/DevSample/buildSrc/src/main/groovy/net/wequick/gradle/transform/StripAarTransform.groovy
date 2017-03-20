@@ -25,6 +25,7 @@ import com.android.build.api.transform.TransformInput
 import com.android.build.api.transform.TransformOutputProvider
 import com.android.build.gradle.internal.pipeline.TransformManager
 import net.wequick.gradle.AppExtension
+import net.wequick.gradle.util.AarPath
 import org.apache.commons.io.FileUtils
 import org.gradle.api.Project
 import org.gradle.api.Task
@@ -83,6 +84,14 @@ public class StripAarTransform extends Transform {
                     return
                 }
 
+                // Strip from build-cache for android plugin 2.3.0+
+                AarPath aarPath = new AarPath(src)
+                for (aar in small.splitAars) {
+                    if (aarPath.explodedFromAar(aar)) {
+                        return
+                    }
+                }
+
                 // Copy the jar and rename
                 File version = src.parentFile
                 String versionName = version.name
@@ -99,11 +108,19 @@ public class StripAarTransform extends Transform {
                         // **/support-v4/23.2.1/jars/libs/internal_impl-23.2.1.jar
                         // => support-v4-internal_impl-23.2.1.jar
                         moduleName = version.parentFile.parentFile.parentFile.name
+                    } else if (version.parentFile.name == 'default') {
+                        // Compat for android plugin 2.3.0
+                        // Sample/lib.utils/build/intermediates/bundles/default/libs/mylib.jar
+                        moduleName = version.parentFile.parentFile.parentFile.parentFile.parentFile.name
                     } else {
                         // [projectDir]/libs/mylib.jar
                         // => [projectName]-mylib.jar
                         moduleName = "${project.name}"
                     }
+                } else if (versionName == 'default') {
+                    // Compat for android plugin 2.3.0
+                    // Sample/jni_plugin/intermediates/bundles/default/classes.jar
+                    moduleName = version.parentFile.parentFile.parentFile.parentFile.name
                 } else {
                     moduleName = "${version.parentFile.parentFile.name}-${version.parentFile.name}"
                 }

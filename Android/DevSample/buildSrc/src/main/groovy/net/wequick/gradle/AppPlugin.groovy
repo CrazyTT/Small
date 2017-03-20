@@ -24,12 +24,13 @@ import com.android.build.gradle.tasks.ProcessTestManifest
 import com.android.build.gradle.tasks.MergeManifests
 import com.android.build.gradle.tasks.MergeSourceSetFolders
 import com.android.build.gradle.tasks.ProcessAndroidResources
-import com.android.builder.dependency.LibraryDependency
+
 import com.android.sdklib.BuildToolInfo
 import groovy.io.FileType
 import net.wequick.gradle.aapt.Aapt
 import net.wequick.gradle.aapt.SymbolParser
 import net.wequick.gradle.transform.StripAarTransform
+import net.wequick.gradle.util.AarPath
 import net.wequick.gradle.util.ClassFileUtils
 import net.wequick.gradle.util.JNIUtils
 import net.wequick.gradle.util.Log
@@ -50,6 +51,7 @@ class AppPlugin extends BundlePlugin {
 
     protected Set<Project> mDependentLibProjects
     protected Set<Project> mTransitiveDependentLibProjects
+    protected Set<Project> mCompiledProjects
     protected Set<Map> mUserLibAars
     protected Set<File> mLibraryJars
     protected File mMinifyJar
@@ -91,12 +93,14 @@ class AppPlugin extends BundlePlugin {
         Set<DefaultProjectDependency> smallLibs = []
         mUserLibAars = []
         mDependentLibProjects = []
+        mCompiledProjects = []
         allLibs.each {
             if (rootSmall.isLibProject(it.dependencyProject)) {
                 smallLibs.add(it)
                 mDependentLibProjects.add(it.dependencyProject)
             } else {
-                mUserLibAars.add(group: it.group, name: it.name, version: it.version)
+                mCompiledProjects.add(it.dependencyProject)
+                collectAarsOfLibrary(it.dependencyProject, mUserLibAars)
             }
         }
 
@@ -151,6 +155,28 @@ class AppPlugin extends BundlePlugin {
 
         mLibraryJars.addAll(libDependentJars)
 
+        // Collect stub and small jars in host
+        Set<Project> sharedProjects = []
+        sharedProjects.addAll(rootSmall.hostStubProjects)
+        if (rootSmall.smallProject != null) {
+            sharedProjects.add(rootSmall.smallProject)
+        }
+        sharedProjects.each {
+            def jarTask = it.tasks.withType(TransformTask.class).find {
+                it.variantName == 'release' && it.transform.name == 'syncLibJars'
+            }
+            if (jarTask != null) {
+                mLibraryJars.addAll(jarTask.otherFileOutputs)
+            }
+        }
+
+        rootSmall.hostProject.tasks.withType(TransformTask.class).each {
+            if ((it.variantName == 'release' || it.variantName.contains("Release"))
+                    && (it.transform.name == 'dex' || it.transform.name == 'proguard')) {
+                mLibraryJars.addAll(it.streamInputs.findAll { it.name.endsWith('.jar') })
+            }
+        }
+
         return mLibraryJars
     }
 
@@ -182,12 +208,22 @@ class AppPlugin extends BundlePlugin {
         project.tasks.withType(MergeManifests.class).each {
             if (it.variantName.startsWith('release')) return
 
+            if (it.hasProperty('providers')) {
+                it.providers = []
+                return
+            }
+
             hookProcessDebugManifest(it, it.libraries)
         }
 
         // processDebugAndroidTestManifest
         project.tasks.withType(ProcessTestManifest.class).each {
             if (it.variantName.startsWith('release')) return
+
+            if (it.hasProperty('providers')) {
+                it.providers = []
+                return
+            }
 
             hookProcessDebugManifest(it, it.libraries)
         }
@@ -196,11 +232,13 @@ class AppPlugin extends BundlePlugin {
     protected void collectLibManifests(def lib, Set outFiles) {
         outFiles.add(lib.getManifest())
 
-        if (lib instanceof LibraryDependency) { // android gradle 2.2.0+
+        if (lib.hasProperty("libraryDependencies")) {
+            // >= 2.2.0
             lib.getLibraryDependencies().each {
                 collectLibManifests(it, outFiles)
             }
-        } else { // android gradle 2.2.0-
+        } else {
+            // < 2.2.0
             lib.getManifestDependencies().each {
                 collectLibManifests(it, outFiles)
             }
@@ -209,6 +247,11 @@ class AppPlugin extends BundlePlugin {
 
     protected void hookProcessDebugManifest(Task processDebugManifest,
                                             List libs) {
+        if (processDebugManifest.hasProperty('providers')) {
+            processDebugManifest.providers = []
+            return
+        }
+
         processDebugManifest.doFirst {
             def libManifests = new HashSet<File>()
             libs.each {
@@ -902,10 +945,9 @@ class AppPlugin extends BundlePlugin {
         def jniDirs = android.sourceSets.main.jniLibs.srcDirs
         if (jniDirs == null) jniDirs = []
         // Collect ABIs from AARs
-        small.explodeAarDirs.each { dir ->
-            File jniDir = new File(dir, 'jni')
-            if (!jniDir.exists()) return
-            jniDirs.add(jniDir)
+        mCompiledProjects.each {
+            com.android.build.gradle.BaseExtension libAndrioid = it.android
+            jniDirs += libAndrioid.sourceSets.main.jniLibs.srcDirs
         }
         def filters = android.defaultConfig.ndkConfig.abiFilters
         jniDirs.each { dir ->
@@ -950,16 +992,12 @@ class AppPlugin extends BundlePlugin {
     def hookMergeJniLibs(TransformTask t) {
         stripAarFiles(t, { splitPaths ->
             t.streamInputs.each {
-                def version = it.parentFile
-                def name = version.parentFile
-                def group = name.parentFile
-                def root = group.parentFile
-                if (root.name != 'exploded-aar') return
-
-                def aar = [group: group.name, name: name.name, version: version.name]
-                if (mUserLibAars.contains(aar)) {
-                    // keep the user libraries
-                    return
+                AarPath aarPath = new AarPath(it)
+                for (aar in mUserLibAars) {
+                    if (aarPath.explodedFromAar(aar)) {
+                        // keep the user libraries
+                        return
+                    }
                 }
 
                 splitPaths.add(it)
@@ -1067,20 +1105,25 @@ class AppPlugin extends BundlePlugin {
         // Collect aar(s) in lib.*
         mTransitiveDependentLibProjects.each { lib ->
             // lib.* dependencies
-            collectAarsOfProject(lib, smallLibAars)
-
-            // lib.* self
-            smallLibAars.add(group: lib.group, name: lib.name, version: lib.version)
+            collectAarsOfProject(lib, true, smallLibAars)
         }
 
         // Collect aar(s) in host
-        collectAarsOfProject(rootSmall.hostProject, smallLibAars)
+        collectAarsOfProject(rootSmall.hostProject, false, smallLibAars)
 
         small.splitAars = smallLibAars
         small.retainedAars = mUserLibAars
     }
 
-    protected def collectAarsOfProject(Project project, HashSet outAars) {
+    protected static def collectAarsOfLibrary(Project lib, HashSet outAars) {
+        // lib.* self
+        outAars.add(group: lib.group, name: lib.name, version: lib.version)
+        // lib.* self for android plugin 2.3.0+
+        File dir = lib.projectDir
+        outAars.add(group: dir.parentFile.name, name: dir.name, version: lib.version)
+    }
+
+    protected def collectAarsOfProject(Project project, boolean isLib, HashSet outAars) {
         String dependenciesFileName = "$project.name-D.txt"
 
         // Pure aars
@@ -1090,6 +1133,10 @@ class AppPlugin extends BundlePlugin {
         // Jar-only aars
         file = new File(rootSmall.preLinkJarDir, dependenciesFileName)
         collectAars(file, project, outAars)
+
+        if (isLib) {
+            collectAarsOfLibrary(project, outAars)
+        }
     }
 
     private def hookProcessManifest(Task processManifest) {
@@ -1097,22 +1144,26 @@ class AppPlugin extends BundlePlugin {
         // manifests, the `processManifest` task will raise an conflict error.
         // Cause the release mode doesn't need to merge the manifest of lib.*, simply split
         // out the manifest dependencies from them.
-        processManifest.doFirst { MergeManifests it ->
-            if (pluginType != PluginType.App) return
+        if (processManifest.hasProperty('providers')) {
+            processManifest.providers = []
+        } else {
+            processManifest.doFirst { MergeManifests it ->
+                if (pluginType != PluginType.App) return
 
-            def libs = it.libraries
-            def smallLibs = []
-            libs.each {
-                def components = it.name.split(':') // e.g. 'Sample:lib.style:unspecified'
-                if (components.size() != 3) return
+                def libs = it.libraries
+                def smallLibs = []
+                libs.each {
+                    def components = it.name.split(':') // e.g. 'Sample:lib.style:unspecified'
+                    if (components.size() != 3) return
 
-                def projectName = components[1]
-                if (!rootSmall.isLibProject(projectName)) return
+                    def projectName = components[1]
+                    if (!rootSmall.isLibProject(projectName)) return
 
-                smallLibs.add(it)
+                    smallLibs.add(it)
+                }
+                libs.removeAll(smallLibs)
+                it.libraries = libs
             }
-            libs.removeAll(smallLibs)
-            it.libraries = libs
         }
         // Hook process-manifest task to remove the `android:icon' and `android:label' attribute
         // which declared in the plugin `AndroidManifest.xml' application node. (for #11)
